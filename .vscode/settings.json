@@ -1,0 +1,6 @@
+  {
+    "python.analysis.extraPaths": [
+      "D:/tools/IDA Professional 9.2/python"
+    ],
+    "python.analysis.stubPath": "D:/tools/IDA Professional 9.2/python"
+  }
