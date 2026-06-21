@@ -37,6 +37,19 @@ class BaseBlock:
     succs = []
 
 
+@dataclass
+class CfgNode:
+    block_addr: int              # 真实块地址
+    in_state:   int              # 进入这个块的 state 值(dispatch 到这里的那个 state)
+    kind:       str              # "uncond" | "cond" | "indirect" | "return" | "data"
+    # 后继(已翻译成块地址):
+    succ_uncond: int = None              # 无条件后继块地址
+    succ_true:   int = None              # 条件真 后继块地址
+    succ_false:  int = None              # 条件假 后继块地址
+    cond_expr:   object = None           # 条件表达式(回写时生成 b.cc 用)
+    # 原始 state 值(调试/对账用):
+    raw_next:    object = None           # SE 算出来的原始 next_state 表达式
+
 cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
 cs.detail = True
 
@@ -599,7 +612,9 @@ def dispatch(state_val, dispatch_entry, dispatch_bbs, real_starts):
 
 
     cur = lifter.loc_db.get_offset_location(dispatch_entry)
-    for _ in range(50):                       # 防死循环
+    for _ in range(500):                       # 防死循环
+        off = lifter.loc_db.get_location_offset(cur)
+        
         irblock = ircfg.get_block(cur)
         sb.eval_updt_irblock(irblock)
         dst = expr_simp_explicit(sb.symbols[ircfg.IRDst])
@@ -640,6 +655,7 @@ def build_miasm():
 
 def build_block_state():
     # block_start -> [(cond, succ_block), ...]
+    all_states = []
     block_next_state = {} 
     for bb in real_bbs:
         expr = se_one_block(ircfg, lifter, bb.start, state_reg="X8")
@@ -661,14 +677,25 @@ def build_block_state():
         elif expr.is_int():                          # 单后继
             succ = int(expr)
             block_next_state[bb.start] = [(None, succ)]
+            all_states.append(succ)
         elif isinstance(expr, ExprCond):           # CSEL 两源
             s_true  = int(expr.src1)
             s_false = int(expr.src2)
             block_next_state[bb.start] = [(expr.cond, s_true), (None, s_false)]
+            all_states.append(s_true)
+            all_states.append(s_false)
         else:
             pass
         print(hex(bb.start), "->", expr)      
-    pprint(block_next_state, width=40)  
+
+    # pprint(block_next_state, width=40)  
+
+    real_starts = [b.start for b in real_bbs]
+    state_to_block = {}
+    for s in all_states:
+        state_to_block[s] = dispatch(s, 0x4E6C48, dispatch_bbs, real_starts)
+
+    pprint(state_to_block, width=40)  
     pass
 
 
@@ -681,8 +708,8 @@ build_block_state()
 
 
 
-# real_starts = [b.start for b in real_bbs]
-# res = dispatch(0x58DFE9BB, 0x4E6C48, None, real_starts)
-# print(res)
+starts = [b.start for b in real_bbs ]
+res = dispatch(0x606703F, 0x4E6C48, None, starts)
+print(res)
 
 
