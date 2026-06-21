@@ -188,7 +188,7 @@ def se_one_block(ircfg, lifter, block_start, state_reg):
     if cur is None:
         cur = lifter.loc_db.get_or_create_offset_location(block_start)
 
-    for _ in range(20):  # 防止死循环
+    for _ in range(200):  # 防止死循环
         off = lifter.loc_db.get_location_offset(cur)
 
         if not in_func(off):
@@ -653,7 +653,196 @@ def build_miasm():
     #     expr = se_one_block(ircfg, lifter, bb.start, state_reg="X8")
     #     print(hex(bb.start), "->", expr)          
 
+def get_miasm_reg(reg_name: str):
+    reg_name = reg_name.upper()
+
+    # W8 -> X8，miasm 里通常用 X 寄存器对象
+    if reg_name.startswith("W"):
+        reg_name = "X" + reg_name[1:]
+
+    return getattr(arm64_regs, reg_name)
+
+
+def expr_to_int(expr):
+    if isinstance(expr, ExprInt):
+        return int(expr)
+    if hasattr(expr, "is_int") and expr.is_int():
+        return int(expr)
+    return None
+
+
+def loc_to_off(loc_key):
+    if loc_key is None:
+        return None
+    return lifter.loc_db.get_location_offset(loc_key)
+
+
+def get_existing_loc(ea: int):
+    loc = lifter.loc_db.get_offset_location(ea)
+    if loc is None:
+        return None
+    if ircfg.get_block(loc) is None:
+        return None
+    return loc
+
+
+def se_run_block(sb: SymbolicExecutionEngine, cur, max_bl_chain=200):
+    """
+    从 cur 开始执行。
+    如果 block 以 BL/BLR 结束，则继续执行后继，直到遇到非 BL 结尾的 block。
+    返回:
+        success, last_cur, dst
+    """
+    last_cur = cur
+    dst = None
+
+    for _ in range(max_bl_chain):
+        off = loc_to_off(cur)
+
+        if off is None:
+            return False, last_cur, dst
+
+        if not in_func(off):
+            print('out of the function: ' + hex(off))
+            return False, last_cur, dst
+
+        irblock = ircfg.get_block(cur)
+        if irblock is None:
+            print('missing irblock: ' + hex(off))
+            return False, last_cur, dst
+
+        sb.eval_updt_irblock(irblock)
+        last_cur = cur
+
+        dst = sb.symbols[ircfg.IRDst]
+
+        asm_block = asmcfg.loc_key_to_block(cur)
+        if not is_block_end_with_bl(asm_block):
+            break
+
+        nxt = resolve_dst_to_loc(dst, lifter.loc_db)
+        if nxt is None:
+            break
+
+        if ircfg.get_block(nxt) is None:
+            break
+
+        cur = nxt
+
+    return True, last_cur, dst
+
+
+def se_run(block_start, state_reg, dispatch, real_starts, max_steps=500):
+    """
+    执行一个 block，追踪它最终写出的 next_state，
+    并判断它最后跳到 dispatcher 还是 real block。
+
+    返回:
+        dispatch_state, next_real_off
+    """
+    dispatch_state = None
+    next_real_off = None
+
+    sb = SymbolicExecutionEngine(lifter)
+    set_init_state_symbol(sb)
+    state_reg_expr = get_miasm_reg(state_reg)
+
+    cur = get_existing_loc(block_start)
+    if cur is None:
+        print('missing start block ir: ' + hex(block_start))
+        return -1, -1
+
+    # dispatch 可以是单个 int，也可以是 set/list/tuple
+    if isinstance(dispatch, int):
+        dispatch_starts = {dispatch}
+    else:
+        dispatch_starts = set(dispatch)
+
+    real_starts = set(real_starts)
+
+    next_state = None
+    visited = set()
+
+    for _ in range(max_steps):
+        cur_off = loc_to_off(cur)
+
+        state_val = None
+        try:
+            state_expr_before = sb.symbols[state_reg_expr]
+            state_val = expr_to_int(state_expr_before)
+        except Exception:
+            pass
+
+        visit_key = (cur_off, state_val)
+        if visit_key in visited:
+            print('hit visited: cur=' + hex(cur_off) + ' state=' + (hex(state_val) if state_val is not None else 'None'))
+            break
+        visited.add(visit_key)
+
+        ok, last_cur, dst = se_run_block(sb, cur)
+        if not ok:
+            break
+
+        try:
+            expr = sb.symbols[state_reg_expr]
+        except Exception:
+            expr = None
+
+        cur_state = expr_to_int(expr)
+        if cur_state is not None and next_state is None:
+            # 始终保存最新 state，不要只保存第一次
+            next_state = cur_state
+
+        if dst is None:
+            break
+
+        nxt = resolve_dst_to_loc(dst, lifter.loc_db)
+        if nxt is None:
+            break
+
+        nxt_off = loc_to_off(nxt)
+        if nxt_off is None:
+            break
+        
+        # print(f'next offset: {hex(nxt_off)}')
+        if nxt_off in dispatch_starts:
+            dispatch_state = next_state
+            break
+
+        if nxt_off in real_starts:
+            next_real_off = nxt_off
+            break
+
+        if ircfg.get_block(nxt) is None:
+            print('next irblock missing: ' + hex(nxt_off))
+            break
+
+        cur = nxt
+
+    if dispatch_state is None:
+        dispatch_state = -1
+
+    if next_real_off is None:
+        next_real_off = -1
+
+    print(
+        f'block_start: {hex(block_start)} '
+        f'dispatch_state: {hex(dispatch_state)} '
+        f'next_real_off: {hex(next_real_off)}'
+    )
+
+    return dispatch_state, next_real_off
+
+
 def build_block_state():
+    
+    real_starts = [b.start for b in real_bbs]
+    dispatch_off = 0x4E6C48
+
+    for bb in real_bbs:
+        se_run(bb.start, "X8", dispatch_off, real_starts)
+
+    return
     # block_start -> [(cond, succ_block), ...]
     all_states = []
     block_next_state = {} 
