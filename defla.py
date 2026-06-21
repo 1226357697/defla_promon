@@ -3,15 +3,19 @@ from capstone import *
 from capstone.arm64 import *
 from capstone.arm64_const import *
 
+import miasm.arch.aarch64.regs as arm64_regs
+from miasm.expression.simplifications import expr_simp_explicit
+from miasm.expression.simplifications import expr_simp
 from miasm.core.locationdb import LocationDB
 from miasm.core.bin_stream import bin_stream_str
 from miasm.analysis.machine import Machine
-from miasm.core.asmblock import AsmCFG, AsmBlock
 from miasm.ir.symbexec import SymbolicExecutionEngine
-from miasm.expression.expression import ExprMem, ExprId, ExprInt
+from miasm.expression.expression import ExprId, ExprInt, ExprCond
+_MACHINE = Machine("aarch64l")
 
 from dataclasses import dataclass, field
 from enum import Enum
+from pprint import pprint
 
 class BlockKind(Enum):
     PROLOGUE = "prologue"
@@ -29,6 +33,8 @@ class BaseBlock:
     raw_bytes:bytes = b''
     kind:BlockKind = BlockKind.UNKNOWN
     insts:list[CsInsn] = field(default_factory=list)
+    preds = []
+    succs = []
 
 
 cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
@@ -108,10 +114,99 @@ cea = ida_kernwin.get_screen_ea()
 f = ida_funcs.get_func(cea)
 fc = ida_gdl.FlowChart(f, flags=ida_gdl.FC_PREDS)
 bbs:list[BaseBlock] = []
+bbs_maps = {}
 state_regs = set()
 prologue_bb = None
 real_bbs = []
 dispatch_bbs = []
+asmcfg = None
+ircfg = None
+lifter = None
+init_state_maps = {}
+
+def in_func(ea):
+    func_start = f.start_ea
+    func_end = f.end_ea    
+    return ea >= func_start and ea < func_end
+
+def build_func_ircfg(func_start, func_bytes):
+    """整个函数喂进去,miasm 自己分块,返回 ircfg + lifter。"""
+    loc_db = LocationDB()
+    bs     = bin_stream_str(func_bytes, base_address=func_start)  # 真实VA
+    mdis   = _MACHINE.dis_engine(bs, loc_db=loc_db)
+    lifter = _MACHINE.lifter_model_call(loc_db)   # BL 当黑盒,不跟进调用
+
+    mdis.dont_dis = [func_start + len(func_bytes)]
+    asmcfg = mdis.dis_multiblock(func_start)      # 从函数入口,miasm 自己切所有块
+    ircfg  = lifter.new_ircfg_from_asmcfg(asmcfg)
+    
+    return asmcfg, ircfg, lifter
+
+
+# def se_one_block(ircfg, lifter, block_start, state_reg):
+#     """对函数里的某个块跑 SE,读 state 写回。"""
+#     sb = SymbolicExecutionEngine(lifter)
+#     sb.run_block_at(ircfg, block_start)
+
+#     return sb.symbols[ExprId(state_reg, 64)]
+
+def is_block_end_with_bl(asm_block):
+    if not asm_block.lines:
+        return False
+
+    last = asm_block.lines[-1]
+    return last.name in ("BL", "BLR")
+
+def resolve_dst_to_loc(dst, loc_db):
+    if dst.is_loc():
+        return dst.loc_key
+
+    if isinstance(dst, ExprInt):
+        ea = int(dst)
+        return loc_db.get_or_create_offset_location(ea)
+
+    return None
+
+def se_one_block(ircfg, lifter, block_start, state_reg):
+    
+    sb = SymbolicExecutionEngine(lifter)
+
+    cur = lifter.loc_db.get_offset_location(block_start)
+    if cur is None:
+        cur = lifter.loc_db.get_or_create_offset_location(block_start)
+
+    for _ in range(20):  # 防止死循环
+        off = lifter.loc_db.get_location_offset(cur)
+
+        if not in_func(off):
+            print('out of the function: 0x' + hex(off))
+            return None
+
+        irblock = ircfg.get_block(cur)
+    
+        if irblock is None:
+            print('cur: ' + hex(off)  + '-' +  hex(block_start)+ ' is none')
+            return None
+        
+        sb.eval_updt_irblock(irblock)
+
+        asm_block = asmcfg.loc_key_to_block(cur)
+
+        if not is_block_end_with_bl(asm_block):
+            break
+
+        dst = sb.symbols[ircfg.IRDst]
+        if dst is None:
+            break
+
+        nxt = resolve_dst_to_loc(dst, lifter.loc_db)
+        if nxt is None:
+            break
+
+        cur = nxt
+
+    return sb.symbols[ExprId(state_reg, 64)]
+
 
 def print_function_cfg():
     for bb in fc:
@@ -316,7 +411,11 @@ def init_bbs():
         assert(len(bb.raw_bytes) % 4 == 0)
 
         bb.insts = [insn for insn in cs.disasm(bb.raw_bytes, bb.start)]
+        bb.preds = [b.start_ea for b in  list(b.preds())] 
+        bb.succs = [b.start_ea for b in  list(b.succs())]
+
         bbs.append(bb)
+        bbs_maps[bb.start] = bb
 
 
 def bbs_kind_is_ret(bb:BaseBlock):
@@ -441,7 +540,7 @@ def is_dispatch_bbs_category(bb:BaseBlock):
 def debug_print_bbs():
 
     # ------------- print_ blocks ------------- 
-    print_state_regs()
+    # print_state_regs()
     # print_bb_by_kind(BlockKind.PROLOGUE)
     # print_bb_by_kind(BlockKind.RETURN)
     # print_bb_by_kind(BlockKind.REAL)
@@ -455,6 +554,7 @@ def init_fla_cfg_bbs():
     global real_bbs
     global dispatch_bbs
     global prologue_bb
+    global init_state_maps
 
     init_bbs()
     explore_bbs_kind()
@@ -470,13 +570,119 @@ def init_fla_cfg_bbs():
     prologue_bb = prolo_bbs[0]
 
     real_bbs = [bb for bb in bbs if is_real_bbs_category(bb)]           
-    dispatch_bbs = [bb for bb in bbs if is_dispatch_bbs_category(bb)]           
+    dispatch_bbs = [bb for bb in bbs if is_dispatch_bbs_category(bb)]     
+
+    init_state_maps =  block_constants(prologue_bb)
+
+def set_init_state_symbol(sb:SymbolicExecutionEngine):
+
+    def capstone_reg_to_miasm_reg(reg_id):
+        name = cs.reg_name(reg_id).upper()
+
+        # W8 -> X8
+        if name.startswith("W"):
+            name = "X" + name[1:]
+
+        return getattr(arm64_regs, name)
+
+    for reg_id, value in init_state_maps.items():
+        mreg = capstone_reg_to_miasm_reg(reg_id)
+        sb.symbols[mreg] = ExprInt(value, mreg.size)
 
 
+def dispatch(state_val, dispatch_entry, dispatch_bbs, real_starts):
+    """喂一个 state 值,返回它落到的真实块地址。"""
+    sb = SymbolicExecutionEngine(lifter)
+    sb.expr_simp = expr_simp   
+    set_init_state_symbol(sb)
+    sb.symbols[ExprId("X8", 64)] = ExprInt(state_val, 64)   # 把 state 设成具体值
 
+
+    cur = lifter.loc_db.get_offset_location(dispatch_entry)
+    for _ in range(50):                       # 防死循环
+        irblock = ircfg.get_block(cur)
+        sb.eval_updt_irblock(irblock)
+        dst = expr_simp_explicit(sb.symbols[ircfg.IRDst])
+        
+        if dst.is_loc():
+            nxt = lifter.loc_db.get_location_offset(dst.loc_key)
+            cur = dst.loc_key
+
+        elif isinstance(dst, ExprInt):
+            nxt = int(dst)
+            cur = lifter.loc_db.get_or_create_offset_location(nxt)
+
+        else:
+            break
+
+        if nxt in real_starts:
+            return nxt
+    return None
+
+
+def build_miasm():
+    global ircfg
+    global lifter
+    global asmcfg
+
+    func_start = f.start_ea
+    func_end = f.end_ea
+    func_bytes = read_bytes(func_start, func_end - func_start)
+    asmcfg, ircfg, lifter = build_func_ircfg(f.start_ea, func_bytes)
+
+    # for bb in real_bbs:
+    #     expr = se_one_block(ircfg, lifter, bb.start, state_reg="X8")
+    #     print(hex(bb.start), "->", expr)    
+
+    # for bb in dispatch_bbs:
+    #     expr = se_one_block(ircfg, lifter, bb.start, state_reg="X8")
+    #     print(hex(bb.start), "->", expr)          
+
+def build_block_state():
+    # block_start -> [(cond, succ_block), ...]
+    block_next_state = {} 
+    for bb in real_bbs:
+        expr = se_one_block(ircfg, lifter, bb.start, state_reg="X8")
+        # print('expr: ' + str(type(expr)))
+        if  expr is None:
+            pass
+        elif isinstance(expr,ExprId):
+            # 继续探索
+            if len(bb.succs) == 1:
+                nxt = bb.succs[0]
+                # print('trying next block: 0x'+hex(nxt))
+                expr = se_one_block(ircfg, lifter, nxt, state_reg="X8")
+            elif len(bb.succs) == 0:
+                pass
+
+
+        if expr is None:
+              block_next_state[bb.start] = [(None, None)]
+        elif expr.is_int():                          # 单后继
+            succ = int(expr)
+            block_next_state[bb.start] = [(None, succ)]
+        elif isinstance(expr, ExprCond):           # CSEL 两源
+            s_true  = int(expr.src1)
+            s_false = int(expr.src2)
+            block_next_state[bb.start] = [(expr.cond, s_true), (None, s_false)]
+        else:
+            pass
+        print(hex(bb.start), "->", expr)      
+    pprint(block_next_state, width=40)  
+    pass
 
 
 init_fla_cfg_bbs()
 # print_real_bbs()
 # print_dispatch_bbs()
+
+build_miasm()
+build_block_state()
+
+
+
+# real_starts = [b.start for b in real_bbs]
+# res = dispatch(0x58DFE9BB, 0x4E6C48, None, real_starts)
+# print(res)
+
 
