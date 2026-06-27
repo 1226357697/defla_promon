@@ -10,7 +10,7 @@ from miasm.core.locationdb import LocationDB
 from miasm.core.bin_stream import bin_stream_str
 from miasm.analysis.machine import Machine
 from miasm.ir.symbexec import SymbolicExecutionEngine
-from miasm.expression.expression import ExprId, ExprInt, ExprCond
+from miasm.expression.expression import ExprId, ExprInt, ExprCond, ExprOp, ExprMem
 _MACHINE = Machine("aarch64l")
 
 from dataclasses import dataclass, field
@@ -38,17 +38,47 @@ class BaseBlock:
 
 
 @dataclass
-class CfgNode:
-    block_addr: int              # 真实块地址
-    in_state:   int              # 进入这个块的 state 值(dispatch 到这里的那个 state)
-    kind:       str              # "uncond" | "cond" | "indirect" | "return" | "data"
-    # 后继(已翻译成块地址):
-    succ_uncond: int = None              # 无条件后继块地址
-    succ_true:   int = None              # 条件真 后继块地址
-    succ_false:  int = None              # 条件假 后继块地址
-    cond_expr:   object = None           # 条件表达式(回写时生成 b.cc 用)
-    # 原始 state 值(调试/对账用):
-    raw_next:    object = None           # SE 算出来的原始 next_state 表达式
+class CFGNode:
+    kind:       str= None
+    start: int = None
+
+    expr:object = None
+    cond:object = None
+    succ_true_state_val:   int = None
+    succ_false_state_val:  int = None
+    
+    succ_true:   int = None           
+    succ_false:  int = None        
+
+def fmt_val(v):
+    if isinstance(v, int):
+        return hex(v)
+    return v
+
+
+def print_cfg(nodes):
+    """
+    nodes 可以是:
+      - list[CFGNode]
+      - dict[int, CFGNode]
+    """
+
+    if isinstance(nodes, dict):
+        iterable = nodes.values()
+    else:
+        iterable = nodes
+
+    for node in iterable:
+        print("=" * 80)
+        print(f"kind:                 {node.kind}")
+        print(f"start:                {fmt_val(node.start)}")
+        print(f"expr:                 {node.expr}")
+        print(f"cond:                 {node.cond}")
+        print(f"succ_true_state_val:  {fmt_val(node.succ_true_state_val)}")
+        print(f"succ_false_state_val: {fmt_val(node.succ_false_state_val)}")
+        print(f"succ_true:            {fmt_val(node.succ_true)}")
+        print(f"succ_false:           {fmt_val(node.succ_false)}")
+
 
 cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
 cs.detail = True
@@ -136,6 +166,7 @@ asmcfg = None
 ircfg = None
 lifter = None
 init_state_maps = {}
+cfg_nodes:list[CFGNode] = []
 
 def in_func(ea):
     func_start = f.start_ea
@@ -574,7 +605,7 @@ def init_fla_cfg_bbs():
     collect_state_regs()
     explore_sub_dispatch2_bb()
 
-    print_bb_by_kind(BlockKind.UNKNOWN)
+    # print_bb_by_kind(BlockKind.UNKNOWN)
     process_unkown_bb()
     debug_print_bbs()
 
@@ -603,7 +634,7 @@ def set_init_state_symbol(sb:SymbolicExecutionEngine):
         sb.symbols[mreg] = ExprInt(value, mreg.size)
 
 
-def dispatch(state_val, dispatch_entry, dispatch_bbs, real_starts):
+def dispatch(state_val, dispatch_entry, real_starts):
     """喂一个 state 值,返回它落到的真实块地址。"""
     sb = SymbolicExecutionEngine(lifter)
     sb.expr_simp = expr_simp   
@@ -732,7 +763,7 @@ def se_run_block(sb: SymbolicExecutionEngine, cur, max_bl_chain=200):
     return True, last_cur, dst
 
 
-def se_run(block_start, state_reg, dispatch, real_starts, max_steps=500):
+def se_run(block_start, state_reg, dispatch, real_starts, max_steps=500) ->CFGNode:
     """
     执行一个 block，追踪它最终写出的 next_state，
     并判断它最后跳到 dispatcher 还是 real block。
@@ -740,8 +771,8 @@ def se_run(block_start, state_reg, dispatch, real_starts, max_steps=500):
     返回:
         dispatch_state, next_real_off
     """
-    dispatch_state = None
     next_real_off = None
+    node = CFGNode()
 
     sb = SymbolicExecutionEngine(lifter)
     set_init_state_symbol(sb)
@@ -750,7 +781,7 @@ def se_run(block_start, state_reg, dispatch, real_starts, max_steps=500):
     cur = get_existing_loc(block_start)
     if cur is None:
         print('missing start block ir: ' + hex(block_start))
-        return -1, -1
+        return None
 
     # dispatch 可以是单个 int，也可以是 set/list/tuple
     if isinstance(dispatch, int):
@@ -760,7 +791,6 @@ def se_run(block_start, state_reg, dispatch, real_starts, max_steps=500):
 
     real_starts = set(real_starts)
 
-    next_state = None
     visited = set()
 
     for _ in range(max_steps):
@@ -788,11 +818,6 @@ def se_run(block_start, state_reg, dispatch, real_starts, max_steps=500):
         except Exception:
             expr = None
 
-        cur_state = expr_to_int(expr)
-        if cur_state is not None and next_state is None:
-            # 始终保存最新 state，不要只保存第一次
-            next_state = cur_state
-
         if dst is None:
             break
 
@@ -804,9 +829,7 @@ def se_run(block_start, state_reg, dispatch, real_starts, max_steps=500):
         if nxt_off is None:
             break
         
-        # print(f'next offset: {hex(nxt_off)}')
         if nxt_off in dispatch_starts:
-            dispatch_state = next_state
             break
 
         if nxt_off in real_starts:
@@ -819,19 +842,24 @@ def se_run(block_start, state_reg, dispatch, real_starts, max_steps=500):
 
         cur = nxt
 
-    if dispatch_state is None:
-        dispatch_state = -1
 
-    if next_real_off is None:
-        next_real_off = -1
 
-    print(
-        f'block_start: {hex(block_start)} '
-        f'dispatch_state: {hex(dispatch_state)} '
-        f'next_real_off: {hex(next_real_off)}'
-    )
+    node.start = block_start
+    node.expr = expr
 
-    return dispatch_state, next_real_off
+    if isinstance(expr, ExprInt):
+        node.succ_true_state_val = expr_to_int(expr)
+
+    elif isinstance(expr, ExprCond) and isinstance(expr.src1, ExprInt) and isinstance(expr.src2, ExprInt):
+        node.cond = expr.cond
+        node.succ_true_state_val  = expr_to_int(expr.src1)
+        node.succ_false_state_val  = expr_to_int(expr.src2)
+
+    if next_real_off:
+        node.succ_true = next_real_off
+    
+    # print_cfg([node])
+    return node
 
 
 def build_block_state():
@@ -887,18 +915,51 @@ def build_block_state():
     pprint(state_to_block, width=40)  
     pass
 
+def build_cfg_nodes():
+    
+    real_starts = [b.start for b in real_bbs]
+    dispatch_off = 0x4E6C48
+
+    for bb in real_bbs:
+        start = bb.start
+        node = se_run(start, "X8", dispatch_off, real_starts)
+        cfg_nodes.append(node)      
+
+    # print_cfg(cfg_nodes)
+
+    for node in cfg_nodes:
+        if not node.cond:
+            if node.succ_true:
+                continue
+
+            
+            if node.succ_true_state_val:
+                node.succ_true = dispatch(node.succ_true_state_val, dispatch_off, real_starts)
+        else:
+            if node.succ_false and node.succ_true:
+                continue
+
+            if not node.succ_true :
+                
+                if node.succ_true_state_val:
+                    node.succ_true = dispatch(node.succ_true_state_val, dispatch_off, real_starts)
+
+            if not node.succ_false:
+
+                if node.succ_false_state_val:
+                    node.succ_false = dispatch(node.succ_false_state_val, dispatch_off, real_starts)
+
+
+    print_cfg(cfg_nodes)
+    return
+
 
 init_fla_cfg_bbs()
 # print_real_bbs()
 # print_dispatch_bbs()
 
 build_miasm()
-build_block_state()
+build_cfg_nodes()
 
-
-
-starts = [b.start for b in real_bbs ]
-res = dispatch(0x606703F, 0x4E6C48, None, starts)
-print(res)
 
 
