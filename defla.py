@@ -152,6 +152,30 @@ ARM64_ALU_GROUP = (
     ARM64_INS_BFM,
 )
 
+COND_CC = {
+    ARM64_CC_EQ, ARM64_CC_NE,
+    ARM64_CC_HS, ARM64_CC_LO,
+    ARM64_CC_MI, ARM64_CC_PL,
+    ARM64_CC_VS, ARM64_CC_VC,
+    ARM64_CC_HI, ARM64_CC_LS,
+    ARM64_CC_GE, ARM64_CC_LT,
+    ARM64_CC_GT, ARM64_CC_LE,
+}
+
+def is_cond_branch(insn:CsInsn):
+    if insn.id == ARM64_INS_B and insn.cc in COND_CC:
+        return True
+    
+    if insn.id in (
+        ARM64_INS_CBZ,
+        ARM64_INS_CBNZ,
+        ARM64_INS_TBZ,
+        ARM64_INS_TBNZ,
+    ):
+        return True
+
+    return False
+
 # check_root_22_boot_status_4E6BBC
 cea = ida_kernwin.get_screen_ea()
 f = ida_funcs.get_func(cea)
@@ -166,6 +190,9 @@ asmcfg = None
 ircfg = None
 lifter = None
 init_state_maps = {}
+main_state_reg_str = None
+main_dispatch_bb = None
+
 cfg_nodes:list[CFGNode] = []
 
 def in_func(ea):
@@ -599,6 +626,8 @@ def init_fla_cfg_bbs():
     global dispatch_bbs
     global prologue_bb
     global init_state_maps
+    global main_state_reg_str
+    global main_dispatch_bb
 
     init_bbs()
     explore_bbs_kind()
@@ -618,12 +647,38 @@ def init_fla_cfg_bbs():
 
     init_state_maps =  block_constants(prologue_bb)
 
+    # find main dispatch base block
+    max_pred_count = 0
+    for bb in bbs:
+        if len(bb.preds) > max_pred_count:
+            max_pred_count = len(bb.preds)
+            main_dispatch_bb = bb
+
+    # check disptach is expectation
+    last_inst = main_dispatch_bb.insts[-1]
+    assert is_cond_branch(last_inst)
+
+    print('main dispatch block at:' + hex(main_dispatch_bb.start))
+
+    # find main state reg by main dispatch
+    cond_insns = [ARM64_INS_CMP]
+    for insn in reversed(main_dispatch_bb.insts):
+        if insn.id in cond_insns and len(insn.operands) > 1 and insn.operands[0].type == CS_OP_REG:
+            reg = insn.operands[0].reg
+            main_state_reg_str = cs.reg_name(reg)
+            if main_state_reg_str.startswith("W") or main_state_reg_str.startswith("w"):
+                main_state_reg_str = "X" + main_state_reg_str[1:]
+            break
+
+    print('main state reg is ' + main_state_reg_str)
+
+
 def set_init_state_symbol(sb:SymbolicExecutionEngine):
 
     def capstone_reg_to_miasm_reg(reg_id):
         name = cs.reg_name(reg_id).upper()
 
-        # W8 -> X8
+        # W0 -> X0
         if name.startswith("W"):
             name = "X" + name[1:]
 
@@ -639,7 +694,7 @@ def dispatch(state_val, dispatch_entry, real_starts):
     sb = SymbolicExecutionEngine(lifter)
     sb.expr_simp = expr_simp   
     set_init_state_symbol(sb)
-    sb.symbols[ExprId("X8", 64)] = ExprInt(state_val, 64)   # 把 state 设成具体值
+    sb.symbols[ExprId(main_state_reg_str, 64)] = ExprInt(state_val, 64)   # 把 state 设成具体值
 
 
     cur = lifter.loc_db.get_offset_location(dispatch_entry)
@@ -676,18 +731,12 @@ def build_miasm():
     func_bytes = read_bytes(func_start, func_end - func_start)
     asmcfg, ircfg, lifter = build_func_ircfg(f.start_ea, func_bytes)
 
-    # for bb in real_bbs:
-    #     expr = se_one_block(ircfg, lifter, bb.start, state_reg="X8")
-    #     print(hex(bb.start), "->", expr)    
-
-    # for bb in dispatch_bbs:
-    #     expr = se_one_block(ircfg, lifter, bb.start, state_reg="X8")
-    #     print(hex(bb.start), "->", expr)          
+    
 
 def get_miasm_reg(reg_name: str):
     reg_name = reg_name.upper()
 
-    # W8 -> X8，miasm 里通常用 X 寄存器对象
+    # W -> X，miasm 里通常用 X 寄存器对象
     if reg_name.startswith("W"):
         reg_name = "X" + reg_name[1:]
 
@@ -862,67 +911,14 @@ def se_run(block_start, state_reg, dispatch, real_starts, max_steps=500) ->CFGNo
     return node
 
 
-def build_block_state():
-    
-    real_starts = [b.start for b in real_bbs]
-    dispatch_off = 0x4E6C48
-
-    for bb in real_bbs:
-        se_run(bb.start, "X8", dispatch_off, real_starts)
-
-    return
-    # block_start -> [(cond, succ_block), ...]
-    all_states = []
-    block_next_state = {} 
-    for bb in real_bbs:
-        expr = se_one_block(ircfg, lifter, bb.start, state_reg="X8")
-        # print('expr: ' + str(type(expr)))
-        if  expr is None:
-            pass
-        elif isinstance(expr,ExprId):
-            # 继续探索
-            if len(bb.succs) == 1:
-                nxt = bb.succs[0]
-                # print('trying next block: 0x'+hex(nxt))
-                expr = se_one_block(ircfg, lifter, nxt, state_reg="X8")
-            elif len(bb.succs) == 0:
-                pass
-
-
-        if expr is None:
-              block_next_state[bb.start] = [(None, None)]
-        elif expr.is_int():                          # 单后继
-            succ = int(expr)
-            block_next_state[bb.start] = [(None, succ)]
-            all_states.append(succ)
-        elif isinstance(expr, ExprCond):           # CSEL 两源
-            s_true  = int(expr.src1)
-            s_false = int(expr.src2)
-            block_next_state[bb.start] = [(expr.cond, s_true), (None, s_false)]
-            all_states.append(s_true)
-            all_states.append(s_false)
-        else:
-            pass
-        print(hex(bb.start), "->", expr)      
-
-    # pprint(block_next_state, width=40)  
-
-    real_starts = [b.start for b in real_bbs]
-    state_to_block = {}
-    for s in all_states:
-        state_to_block[s] = dispatch(s, 0x4E6C48, dispatch_bbs, real_starts)
-
-    pprint(state_to_block, width=40)  
-    pass
-
 def build_cfg_nodes():
     
     real_starts = [b.start for b in real_bbs]
-    dispatch_off = 0x4E6C48
+    dispatch_off = main_dispatch_bb.start
 
     for bb in real_bbs:
         start = bb.start
-        node = se_run(start, "X8", dispatch_off, real_starts)
+        node = se_run(start, main_state_reg_str, dispatch_off, real_starts)
         cfg_nodes.append(node)      
 
     # print_cfg(cfg_nodes)
