@@ -14,8 +14,14 @@ from miasm.expression.expression import ExprId, ExprInt, ExprCond, ExprOp, ExprM
 _MACHINE = Machine("aarch64l")
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, IntFlag, auto
 from pprint import pprint
+
+class BlockFlags(IntFlag):
+    NONE = 0
+    HAS_NEXT_STATE  = auto()
+    FALL_THROUGH_TO  = auto()
+    BRANCH_TO  = auto()
 
 class BlockKind(Enum):
     PROLOGUE = "prologue"
@@ -32,6 +38,7 @@ class BaseBlock:
     len: int = 0 
     raw_bytes:bytes = b''
     kind:BlockKind = BlockKind.UNKNOWN
+    flags:BlockFlags = BlockFlags.NONE
     insts:list[CsInsn] = field(default_factory=list)
     preds = []
     succs = []
@@ -41,6 +48,7 @@ class BaseBlock:
 class CFGNode:
     kind:       str= None
     start: int = None
+    flags: BlockFlags = BlockFlags.NONE
 
     expr:object = None
     cond:object = None
@@ -620,6 +628,48 @@ def debug_print_bbs():
 
     pass
 
+def init_real_bbs_flags():
+
+    def reg_to_name(reg):
+        regname = cs.reg_name(reg)
+        if regname.startswith("W") or regname.startswith("w"):
+            regname = "X" + regname[1:]
+        return regname
+
+    for bb in real_bbs:
+
+        reg_maps = block_constants(bb)
+        regnames = [reg_to_name(reg) for reg in reg_maps.keys()]
+
+        if main_state_reg_str in regnames:
+            bb.flags |= BlockFlags.HAS_NEXT_STATE
+        else:
+            if len(bb.succs) == 1:
+                next_bb = bbs_maps.get(bb.succs[0])
+                if next_bb:
+                    reg_maps = block_constants(next_bb)
+                    regnames = [reg_to_name(reg) for reg in reg_maps.keys()]
+                    if main_state_reg_str in regnames:
+                        bb.flags |= BlockFlags.HAS_NEXT_STATE
+
+
+
+        for insn in bb.insts:
+            if insn.id == ARM64_INS_CSEL:
+                bb.flags |= BlockFlags.BRANCH_TO
+                break
+
+        is_ret_bb = bb.insts[-1].id == ARM64_INS_RET
+
+        if not is_ret_bb and BlockFlags.BRANCH_TO  not in bb.flags:
+            bb.flags |= BlockFlags.FALL_THROUGH_TO
+
+        if BlockFlags.BRANCH_TO in bb.flags:
+            bb.flags |= BlockFlags.HAS_NEXT_STATE
+
+
+        # print(f'bb at {hex(bb.start)} flags: {bb.flags!r}')
+    pass
 
 def init_fla_cfg_bbs():
     global real_bbs
@@ -672,6 +722,7 @@ def init_fla_cfg_bbs():
 
     print('main state reg is ' + main_state_reg_str)
 
+    init_real_bbs_flags()
 
 def set_init_state_symbol(sb:SymbolicExecutionEngine):
 
@@ -821,7 +872,6 @@ def se_run(block_start, state_reg, dispatch, real_starts, max_steps=500) ->CFGNo
         dispatch_state, next_real_off
     """
     next_real_off = None
-    node = CFGNode()
 
     sb = SymbolicExecutionEngine(lifter)
     set_init_state_symbol(sb)
@@ -893,6 +943,7 @@ def se_run(block_start, state_reg, dispatch, real_starts, max_steps=500) ->CFGNo
 
 
 
+    node = CFGNode()
     node.start = block_start
     node.expr = expr
 
@@ -918,7 +969,13 @@ def build_cfg_nodes():
 
     for bb in real_bbs:
         start = bb.start
-        node = se_run(start, main_state_reg_str, dispatch_off, real_starts)
+        if BlockFlags.HAS_NEXT_STATE in bb.flags :
+            node = se_run(start, main_state_reg_str, dispatch_off, real_starts)
+        else:
+            node = CFGNode()
+            node.start = start
+        
+        node.flags = bb.flags
         cfg_nodes.append(node)      
 
     # print_cfg(cfg_nodes)
