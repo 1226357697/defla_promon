@@ -961,6 +961,27 @@ def se_run(block_start, state_reg, dispatch, real_starts, max_steps=500) ->CFGNo
     # print_cfg([node])
     return node
 
+def validate_cfg_nodes(cfg_nodes):
+    ok = True
+
+    for node in cfg_nodes:
+        if BlockFlags.HAS_NEXT_STATE not in node.flags:
+            continue
+
+        if node.cond is None:
+            if node.succ_true_state_val is not None and node.succ_true is None:
+                print(...)
+                ok = False
+        else:
+            if node.succ_true_state_val is not None and node.succ_true is None:
+                print(...)
+                ok = False
+
+            if node.succ_false_state_val is not None and node.succ_false is None:
+                print(...)
+                ok = False
+
+    return ok
 
 def build_cfg_nodes():
     
@@ -979,31 +1000,32 @@ def build_cfg_nodes():
         cfg_nodes.append(node)      
 
     # print_cfg(cfg_nodes)
-
     for node in cfg_nodes:
-        if not node.cond:
-            if node.succ_true:
-                continue
-
-            
-            if node.succ_true_state_val:
-                node.succ_true = dispatch(node.succ_true_state_val, dispatch_off, real_starts)
+        if node.cond is None:
+            if node.succ_true is None and node.succ_true_state_val is not None:
+                node.succ_true = dispatch(
+                    node.succ_true_state_val,
+                    dispatch_off,
+                    real_starts,
+                )
         else:
-            if node.succ_false and node.succ_true:
-                continue
+            if node.succ_true is None and node.succ_true_state_val is not None:
+                node.succ_true = dispatch(
+                    node.succ_true_state_val,
+                    dispatch_off,
+                    real_starts,
+                )
 
-            if not node.succ_true :
-                
-                if node.succ_true_state_val:
-                    node.succ_true = dispatch(node.succ_true_state_val, dispatch_off, real_starts)
+            if node.succ_false is None and node.succ_false_state_val is not None:
+                node.succ_false = dispatch(
+                    node.succ_false_state_val,
+                    dispatch_off,
+                    real_starts,
+                )
 
-            if not node.succ_false:
-
-                if node.succ_false_state_val:
-                    node.succ_false = dispatch(node.succ_false_state_val, dispatch_off, real_starts)
-
-
+    
     print_cfg(cfg_nodes)
+    print(f"validate_cfg_nodes: {validate_cfg_nodes(cfg_nodes)}")
     return
 
 
