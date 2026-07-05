@@ -1,4 +1,6 @@
-import ida_bytes, ida_funcs, ida_auto, ida_kernwin, idaapi, ida_ua, ida_gdl
+import ida_bytes, ida_funcs, ida_auto, ida_kernwin, idaapi, ida_ua, ida_gdl, ida_loader, ida_nalt
+import os
+import shutil
 from capstone import *
 from capstone.arm64 import *
 from capstone.arm64_const import *
@@ -57,6 +59,20 @@ class CFGNode:
     
     succ_true:   int = None           
     succ_false:  int = None        
+
+
+@dataclass
+class PatchPlan:
+    kind: str = None
+    src: int = None
+    patch_ea: int = None
+    patch_size: int = 0
+    old_bytes: bytes = b''
+    new_bytes: bytes = b''
+    succ_true: int = None
+    succ_false: int = None
+    cond_cc: int = None
+    reason: str = None
 
 def fmt_val(v):
     if isinstance(v, int):
@@ -202,6 +218,7 @@ main_state_reg_str = None
 main_dispatch_bb = None
 
 cfg_nodes:list[CFGNode] = []
+dispatch_state_cache = {}
 
 def in_func(ea):
     func_start = f.start_ea
@@ -740,7 +757,7 @@ def set_init_state_symbol(sb:SymbolicExecutionEngine):
         sb.symbols[mreg] = ExprInt(value, mreg.size)
 
 
-def dispatch(state_val, dispatch_entry, real_starts):
+def old_dispatch_unused(state_val, dispatch_entry, real_starts):
     """喂一个 state 值,返回它落到的真实块地址。"""
     sb = SymbolicExecutionEngine(lifter)
     sb.expr_simp = expr_simp   
@@ -955,13 +972,13 @@ def se_run(block_start, state_reg, dispatch, real_starts, max_steps=500) ->CFGNo
         node.succ_true_state_val  = expr_to_int(expr.src1)
         node.succ_false_state_val  = expr_to_int(expr.src2)
 
-    if next_real_off:
+    if next_real_off is not None:
         node.succ_true = next_real_off
     
     # print_cfg([node])
     return node
 
-def validate_cfg_nodes(cfg_nodes):
+def old_validate_cfg_nodes_unused(cfg_nodes):
     ok = True
 
     for node in cfg_nodes:
@@ -983,7 +1000,7 @@ def validate_cfg_nodes(cfg_nodes):
 
     return ok
 
-def build_cfg_nodes():
+def old_build_cfg_nodes_unused():
     
     real_starts = [b.start for b in real_bbs]
     dispatch_off = main_dispatch_bb.start
@@ -1029,12 +1046,654 @@ def build_cfg_nodes():
     return
 
 
+def resolve_dispatch_state(dispatch_entry, state_val, real_starts, resolving=None):
+    real_starts = set(real_starts)
+    cache_key = (dispatch_entry, state_val)
+
+    if cache_key in dispatch_state_cache:
+        return dispatch_state_cache[cache_key]
+
+    if resolving is None:
+        resolving = set()
+
+    if cache_key in resolving:
+        print('[dispatch state loop] entry=' + hex(dispatch_entry) + ' state=' + hex(state_val))
+        return None
+
+    resolving.add(cache_key)
+
+    sb = SymbolicExecutionEngine(lifter)
+    sb.expr_simp = expr_simp
+    set_init_state_symbol(sb)
+
+    state_reg_expr = get_miasm_reg(main_state_reg_str)
+    sb.symbols[state_reg_expr] = ExprInt(state_val, state_reg_expr.size)
+    cur_state_val = state_val
+
+    cur = get_existing_loc(dispatch_entry)
+    if cur is None:
+        print('[dispatch missing entry] entry=' + hex(dispatch_entry))
+        resolving.discard(cache_key)
+        return None
+
+    visited = set()
+    for _ in range(500):
+        off = loc_to_off(cur)
+        if off is None:
+            resolving.discard(cache_key)
+            return None
+
+        try:
+            cur_state_expr = expr_simp_explicit(sb.symbols[state_reg_expr])
+            cur_state_int = expr_to_int(cur_state_expr)
+            if cur_state_int is not None:
+                cur_state_val = cur_state_int
+        except Exception:
+            pass
+
+        visit_key = (off, cur_state_val)
+        if visit_key in visited:
+            print('[dispatch loop] entry=' + hex(dispatch_entry) + ' state=' + hex(cur_state_val) + ' cur=' + hex(off))
+            if cur_state_val != state_val:
+                target = resolve_dispatch_state(dispatch_entry, cur_state_val, real_starts, resolving)
+                dispatch_state_cache[cache_key] = target
+                resolving.discard(cache_key)
+                return target
+
+            resolving.discard(cache_key)
+            return None
+        visited.add(visit_key)
+
+        irblock = ircfg.get_block(cur)
+        if irblock is None:
+            print('[dispatch missing irblock] cur=' + hex(off))
+            resolving.discard(cache_key)
+            return None
+
+        sb.eval_updt_irblock(irblock)
+
+        try:
+            cur_state_expr = expr_simp_explicit(sb.symbols[state_reg_expr])
+            cur_state_int = expr_to_int(cur_state_expr)
+            if cur_state_int is not None:
+                cur_state_val = cur_state_int
+        except Exception:
+            pass
+
+        dst = expr_simp_explicit(sb.symbols[ircfg.IRDst])
+
+        if dst.is_loc():
+            nxt = lifter.loc_db.get_location_offset(dst.loc_key)
+        elif isinstance(dst, ExprInt):
+            nxt = int(dst)
+        else:
+            print('[dispatch unresolved dst] entry=' + hex(dispatch_entry) + ' state=' + hex(state_val) + ' dst=' + str(dst))
+            resolving.discard(cache_key)
+            return None
+
+        if nxt in real_starts:
+            dispatch_state_cache[cache_key] = nxt
+            resolving.discard(cache_key)
+            return nxt
+
+        cur = get_existing_loc(nxt)
+        if cur is None:
+            print('[dispatch dst missing irblock] dst=' + hex(nxt))
+            if cur_state_val != state_val:
+                target = resolve_dispatch_state(dispatch_entry, cur_state_val, real_starts, resolving)
+                dispatch_state_cache[cache_key] = target
+                resolving.discard(cache_key)
+                return target
+
+            resolving.discard(cache_key)
+            return None
+
+    resolving.discard(cache_key)
+    return None
+
+
+def dispatch(state_val, dispatch_entry, real_starts):
+    return resolve_dispatch_state(dispatch_entry, state_val, real_starts)
+
+
+def validate_cfg_nodes(cfg_nodes):
+    ok = True
+
+    for node in cfg_nodes:
+        if BlockFlags.HAS_NEXT_STATE not in node.flags:
+            continue
+
+        if node.cond is None:
+            if node.succ_true_state_val is None:
+                print(
+                    '[missing direct state] '
+                    + 'node=' + hex(node.start)
+                    + ' expr=' + str(node.expr)
+                )
+                ok = False
+            elif node.succ_true is None:
+                print(
+                    '[unresolved direct] '
+                    + 'node=' + hex(node.start)
+                    + ' state=' + hex(node.succ_true_state_val)
+                    + ' expr=' + str(node.expr)
+                )
+                ok = False
+        else:
+            if node.succ_true_state_val is None:
+                print(
+                    '[missing true state] '
+                    + 'node=' + hex(node.start)
+                    + ' cond=' + str(node.cond)
+                    + ' expr=' + str(node.expr)
+                )
+                ok = False
+            elif node.succ_true is None:
+                print(
+                    '[unresolved true] '
+                    + 'node=' + hex(node.start)
+                    + ' state=' + hex(node.succ_true_state_val)
+                    + ' cond=' + str(node.cond)
+                )
+                ok = False
+
+            if node.succ_false_state_val is None:
+                print(
+                    '[missing false state] '
+                    + 'node=' + hex(node.start)
+                    + ' cond=' + str(node.cond)
+                    + ' expr=' + str(node.expr)
+                )
+                ok = False
+            elif node.succ_false is None:
+                print(
+                    '[unresolved false] '
+                    + 'node=' + hex(node.start)
+                    + ' state=' + hex(node.succ_false_state_val)
+                    + ' cond=' + str(node.cond)
+                )
+                ok = False
+
+    return ok
+
+
+def build_cfg_nodes():
+    cfg_nodes.clear()
+    dispatch_state_cache.clear()
+
+    real_starts = [b.start for b in real_bbs]
+    dispatch_off = main_dispatch_bb.start
+
+    for bb in real_bbs:
+        start = bb.start
+        if BlockFlags.HAS_NEXT_STATE in bb.flags:
+            node = se_run(start, main_state_reg_str, dispatch_off, real_starts)
+            if node is None:
+                node = CFGNode()
+                node.start = start
+        else:
+            node = CFGNode()
+            node.start = start
+
+        node.kind = bb.kind.value
+        node.flags = bb.flags
+        cfg_nodes.append(node)
+
+    for node in cfg_nodes:
+        if BlockFlags.HAS_NEXT_STATE not in node.flags:
+            continue
+
+        if node.cond is None:
+            if node.succ_true is None and node.succ_true_state_val is not None:
+                node.succ_true = dispatch(
+                    node.succ_true_state_val,
+                    dispatch_off,
+                    real_starts,
+                )
+        else:
+            if node.succ_true is None and node.succ_true_state_val is not None:
+                node.succ_true = dispatch(
+                    node.succ_true_state_val,
+                    dispatch_off,
+                    real_starts,
+                )
+
+            if node.succ_false is None and node.succ_false_state_val is not None:
+                node.succ_false = dispatch(
+                    node.succ_false_state_val,
+                    dispatch_off,
+                    real_starts,
+                )
+
+    ok = validate_cfg_nodes(cfg_nodes)
+    print_cfg(cfg_nodes)
+    print(f"validate_cfg_nodes: {ok}")
+    return ok
+
+
+def arm64_nop():
+    return bytes.fromhex('1f2003d5')
+
+
+def arm64_encode_b(src_ea, dst_ea):
+    imm = dst_ea - src_ea
+    if imm % 4 != 0:
+        raise ValueError('unaligned B target: ' + hex(src_ea) + ' -> ' + hex(dst_ea))
+
+    imm26 = imm // 4
+    if imm26 < -(1 << 25) or imm26 >= (1 << 25):
+        raise ValueError('B target out of range: ' + hex(src_ea) + ' -> ' + hex(dst_ea))
+
+    insn = 0x14000000 | (imm26 & 0x03ffffff)
+    return insn.to_bytes(4, 'little')
+
+
+def arm64_cond_to_encoding(cc):
+    if cc == ARM64_CC_EQ:
+        return 0x0
+    if cc == ARM64_CC_NE:
+        return 0x1
+    if cc == ARM64_CC_HS:
+        return 0x2
+    if cc == ARM64_CC_LO:
+        return 0x3
+    if cc == ARM64_CC_MI:
+        return 0x4
+    if cc == ARM64_CC_PL:
+        return 0x5
+    if cc == ARM64_CC_VS:
+        return 0x6
+    if cc == ARM64_CC_VC:
+        return 0x7
+    if cc == ARM64_CC_HI:
+        return 0x8
+    if cc == ARM64_CC_LS:
+        return 0x9
+    if cc == ARM64_CC_GE:
+        return 0xa
+    if cc == ARM64_CC_LT:
+        return 0xb
+    if cc == ARM64_CC_GT:
+        return 0xc
+    if cc == ARM64_CC_LE:
+        return 0xd
+
+    raise ValueError('unsupported condition code: ' + str(cc))
+
+
+def arm64_encode_b_cond(src_ea, dst_ea, cc):
+    imm = dst_ea - src_ea
+    if imm % 4 != 0:
+        raise ValueError('unaligned B.cond target: ' + hex(src_ea) + ' -> ' + hex(dst_ea))
+
+    imm19 = imm // 4
+    if imm19 < -(1 << 18) or imm19 >= (1 << 18):
+        raise ValueError('B.cond target out of range: ' + hex(src_ea) + ' -> ' + hex(dst_ea))
+
+    insn = 0x54000000 | ((imm19 & 0x7ffff) << 5) | arm64_cond_to_encoding(cc)
+    return insn.to_bytes(4, 'little')
+
+
+def find_last_csel(bb: BaseBlock):
+    for insn in reversed(bb.insts):
+        if insn.id == ARM64_INS_CSEL:
+            return insn
+    return None
+
+
+def reg_constants_before(bb: BaseBlock, stop_ea):
+    reg_map = {}
+
+    for insn in bb.insts:
+        if insn.address >= stop_ea:
+            break
+
+        insn_id = insn.id
+        oprs = insn.operands
+
+        handled = False
+        if len(oprs) >= 2 and oprs[0].type == ARM64_OP_REG and oprs[1].type == ARM64_OP_IMM:
+            reg = oprs[0].reg
+            imm = oprs[1].imm
+            reg_name = insn.reg_name(reg)
+            bits = 32 if reg_name.startswith('w') else 64
+            mask_bits = (1 << bits) - 1
+
+            if insn_id == ARM64_INS_MOV:
+                reg_map[reg] = imm & mask_bits
+                handled = True
+
+            elif insn_id == ARM64_INS_MOVK:
+                old = reg_map.get(reg, 0)
+
+                shift = 0
+                if oprs[1].shift.type != ARM64_SFT_INVALID:
+                    shift = oprs[1].shift.value
+
+                field_mask = 0xffff << shift
+                value = (old & ~field_mask) | ((imm & 0xffff) << shift)
+                reg_map[reg] = value & mask_bits
+                handled = True
+
+        if handled:
+            continue
+
+        try:
+            _, regs_write = insn.regs_access()
+        except Exception:
+            regs_write = []
+
+        for reg in regs_write:
+            reg_map.pop(reg, None)
+
+    return reg_map
+
+
+def resolve_csel_targets(node: CFGNode, bb: BaseBlock, csel):
+    if len(csel.operands) < 3:
+        return None, None
+
+    if csel.operands[1].type != ARM64_OP_REG or csel.operands[2].type != ARM64_OP_REG:
+        return None, None
+
+    consts = reg_constants_before(bb, csel.address)
+    csel_true_state = consts.get(csel.operands[1].reg)
+    csel_false_state = consts.get(csel.operands[2].reg)
+
+    state_to_target = {
+        node.succ_true_state_val: node.succ_true,
+        node.succ_false_state_val: node.succ_false,
+    }
+
+    cond_true_target = state_to_target.get(csel_true_state)
+    cond_false_target = state_to_target.get(csel_false_state)
+
+    return cond_true_target, cond_false_target
+
+
+def is_uncond_branch_to_dispatch(insn):
+    if insn.id != ARM64_INS_B:
+        return False
+
+    if not insn.operands:
+        return False
+
+    opr = insn.operands[0]
+    if opr.type != ARM64_OP_IMM:
+        return False
+
+    target = opr.imm
+    return target == main_dispatch_bb.start or target in [b.start for b in dispatch_bbs]
+
+
+def writes_main_state_reg(insn):
+    target_reg = main_state_reg_str.upper()
+    if target_reg.startswith('W'):
+        target_reg = 'X' + target_reg[1:]
+
+    if insn.operands:
+        opr = insn.operands[0]
+        if opr.type == ARM64_OP_REG:
+            reg_name = cs.reg_name(opr.reg)
+            if reg_name is not None:
+                reg_name = reg_name.upper()
+                if reg_name.startswith('W'):
+                    reg_name = 'X' + reg_name[1:]
+                if reg_name == target_reg:
+                    return True
+
+    try:
+        _, regs_write = insn.regs_access()
+    except Exception:
+        return False
+
+    for reg in regs_write:
+        reg_name = cs.reg_name(reg)
+        if reg_name is None:
+            continue
+        reg_name = reg_name.upper()
+        if reg_name.startswith('W'):
+            reg_name = 'X' + reg_name[1:]
+        if reg_name == target_reg:
+            return True
+
+    return False
+
+
+def choose_patch_tail(bb: BaseBlock, min_size):
+    if not bb.insts:
+        return None, 0
+
+    start_idx = len(bb.insts) - 1
+
+    while start_idx > 0:
+        insn = bb.insts[start_idx]
+        covered = bb.start + bb.len - insn.address
+
+        if covered >= min_size and (writes_main_state_reg(insn) or is_uncond_branch_to_dispatch(insn)):
+            return insn.address, covered
+
+        prev = bb.insts[start_idx - 1]
+        if not writes_main_state_reg(prev) and not is_uncond_branch_to_dispatch(prev):
+            break
+
+        start_idx -= 1
+
+    patch_ea = bb.insts[-1].address
+    patch_size = bb.start + bb.len - patch_ea
+    if patch_size >= min_size:
+        return patch_ea, patch_size
+
+    return None, 0
+
+
+def make_direct_patch(node: CFGNode, bb: BaseBlock):
+    patch_ea, patch_size = choose_patch_tail(bb, 4)
+    if patch_ea is None:
+        return PatchPlan(kind='error', src=node.start, succ_true=node.succ_true, reason='not enough tail space for direct branch')
+
+    reason = 'replace state write/dispatch branch with direct branch'
+    if not is_uncond_branch_to_dispatch(bb.insts[-1]):
+        reason += '; warning: tail is not dispatch branch'
+
+    new_bytes = arm64_encode_b(patch_ea, node.succ_true)
+    new_bytes += arm64_nop() * ((patch_size - len(new_bytes)) // 4)
+
+    return PatchPlan(
+        kind='direct',
+        src=node.start,
+        patch_ea=patch_ea,
+        patch_size=patch_size,
+        old_bytes=read_bytes(patch_ea, patch_size),
+        new_bytes=new_bytes,
+        succ_true=node.succ_true,
+        reason=reason,
+    )
+
+
+def make_cond_patch(node: CFGNode, bb: BaseBlock):
+    csel = find_last_csel(bb)
+    if csel is None:
+        return PatchPlan(kind='error', src=node.start, succ_true=node.succ_true, succ_false=node.succ_false, reason='missing CSEL for conditional node')
+
+    cond_true_target, cond_false_target = resolve_csel_targets(node, bb, csel)
+    if cond_true_target is None or cond_false_target is None:
+        return PatchPlan(kind='error', src=node.start, succ_true=node.succ_true, succ_false=node.succ_false, cond_cc=csel.cc, reason='cannot map CSEL operands to CFG successors')
+
+    patch_ea = csel.address
+    patch_size = bb.start + bb.len - patch_ea
+    if patch_size < 8:
+        return PatchPlan(kind='error', src=node.start, succ_true=node.succ_true, succ_false=node.succ_false, reason='not enough tail space for conditional branch')
+
+    reason = 'replace CSEL state selection/dispatch branch with conditional direct branches'
+    if not is_uncond_branch_to_dispatch(bb.insts[-1]):
+        reason += '; warning: tail is not dispatch branch'
+
+    new_bytes = arm64_encode_b_cond(patch_ea, cond_true_target, csel.cc)
+    new_bytes += arm64_encode_b(patch_ea + 4, cond_false_target)
+    new_bytes += arm64_nop() * ((patch_size - len(new_bytes)) // 4)
+
+    return PatchPlan(
+        kind='conditional',
+        src=node.start,
+        patch_ea=patch_ea,
+        patch_size=patch_size,
+        old_bytes=read_bytes(patch_ea, patch_size),
+        new_bytes=new_bytes,
+        succ_true=cond_true_target,
+        succ_false=cond_false_target,
+        cond_cc=csel.cc,
+        reason=reason,
+    )
+
+
+def build_patch_plan(cfg_nodes):
+    plans = []
+
+    for node in cfg_nodes:
+        if BlockFlags.HAS_NEXT_STATE not in node.flags:
+            continue
+
+        if node.succ_true is None:
+            continue
+
+        bb = bbs_maps.get(node.start)
+        if bb is None:
+            plans.append(PatchPlan(kind='error', src=node.start, reason='missing source base block'))
+            continue
+
+        if node.cond is None:
+            plans.append(make_direct_patch(node, bb))
+        else:
+            if node.succ_false is None:
+                plans.append(PatchPlan(kind='error', src=node.start, succ_true=node.succ_true, reason='missing false successor'))
+                continue
+            plans.append(make_cond_patch(node, bb))
+
+    return plans
+
+
+def print_patch_plan(plans):
+    print('=' * 80)
+    print('patch plan count: ' + str(len(plans)))
+
+    for plan in plans:
+        print('-' * 80)
+        print('kind:       ' + str(plan.kind))
+        print('src:        ' + str(fmt_val(plan.src)))
+        print('patch_ea:   ' + str(fmt_val(plan.patch_ea)))
+        print('patch_size: ' + str(plan.patch_size))
+        print('succ_true:  ' + str(fmt_val(plan.succ_true)))
+        print('succ_false: ' + str(fmt_val(plan.succ_false)))
+        print('cond_cc:    ' + str(plan.cond_cc))
+        print('old_bytes:  ' + (plan.old_bytes.hex() if plan.old_bytes else ''))
+        print('new_bytes:  ' + (plan.new_bytes.hex() if plan.new_bytes else ''))
+        print('reason:     ' + str(plan.reason))
+
+
+def ea_to_file_offset(ea):
+    file_off = ida_loader.get_fileregion_offset(ea)
+    if file_off == idaapi.BADADDR:
+        return None
+    return file_off
+
+
+def get_input_file_path():
+    path = ida_nalt.get_input_file_path()
+    if path and os.path.exists(path):
+        return path
+    return None
+
+
+def make_output_file_path(input_path):
+    base, ext = os.path.splitext(input_path)
+    return base + '_deobf' + ext
+
+
+def validate_patch_plan_for_file(plans, input_path):
+    with open(input_path, 'rb') as f:
+        for plan in plans:
+            if plan.kind == 'error':
+                print('[patch blocked] error plan at src=' + str(fmt_val(plan.src)) + ' reason=' + str(plan.reason))
+                return False
+
+            if not plan.old_bytes or not plan.new_bytes:
+                print('[patch blocked] empty bytes at src=' + str(fmt_val(plan.src)))
+                return False
+
+            if len(plan.old_bytes) != len(plan.new_bytes):
+                print('[patch blocked] size mismatch at src=' + str(fmt_val(plan.src)))
+                return False
+
+            file_off = ea_to_file_offset(plan.patch_ea)
+            if file_off is None:
+                print('[patch blocked] cannot map ea to file offset: ' + hex(plan.patch_ea))
+                return False
+
+            f.seek(file_off)
+            cur = f.read(len(plan.old_bytes))
+            if cur != plan.old_bytes:
+                print('[patch blocked] old bytes mismatch at ea=' + hex(plan.patch_ea))
+                print('  expected: ' + plan.old_bytes.hex())
+                print('  file:     ' + cur.hex())
+                return False
+
+    return True
+
+
+def apply_patch_plan_to_copy(plans, input_path=None, output_path=None):
+    if input_path is None:
+        input_path = get_input_file_path()
+
+    if input_path is None:
+        ida_path = ida_nalt.get_input_file_path()
+        if ida_path:
+            print('[patch info] IDA input path does not exist: ' + ida_path)
+        print('[patch blocked] cannot get input file path from IDA')
+        print(r'[patch hint] call apply_patch_plan_to_copy(plans, r"D:\path\to\target.so")')
+        return None
+
+    input_path = os.path.abspath(input_path)
+    if not os.path.exists(input_path):
+        print('[patch blocked] input file does not exist: ' + input_path)
+        return None
+
+    if output_path is None:
+        output_path = make_output_file_path(input_path)
+    else:
+        output_path = os.path.abspath(output_path)
+
+    if not validate_patch_plan_for_file(plans, input_path):
+        return None
+
+    shutil.copyfile(input_path, output_path)
+
+    with open(output_path, 'r+b') as f:
+        for plan in plans:
+            file_off = ea_to_file_offset(plan.patch_ea)
+            f.seek(file_off)
+            f.write(plan.new_bytes)
+            print(
+                '[patched] '
+                + 'ea=' + hex(plan.patch_ea)
+                + ' file_off=' + hex(file_off)
+                + ' size=' + str(len(plan.new_bytes))
+                + ' src=' + str(fmt_val(plan.src))
+            )
+
+    print('[patch output] ' + output_path)
+    return output_path
+
+
 init_fla_cfg_bbs()
 # print_real_bbs()
 # print_dispatch_bbs()
 
 build_miasm()
-build_cfg_nodes()
+if build_cfg_nodes():
+    plans = build_patch_plan(cfg_nodes)
+    print_patch_plan(plans)
+    print('call apply_patch_plan_to_copy(plans) to write a patched copy')
 
 
 
